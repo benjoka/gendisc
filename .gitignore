@@ -1,5 +1,5 @@
 distance_matrix.csv
-sequences
 sequences/*
+!sequences/sequences_duesseldorf_rki_april_2022.csv
 .idea
 go.sum
