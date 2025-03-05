@@ -1,0 +1,6 @@
+distance_matrix.csv
+sequences
+sequences/*
+go.mod
+.idea
+go.sum
