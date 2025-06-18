@@ -1,4 +1,4 @@
-distance_matrix.csv
+distance_matrices/distance_matrix.csv
 sequences/*
 !sequences/sequences_duesseldorf_rki_april_2022.csv
 .idea

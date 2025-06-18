@@ -4,12 +4,14 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/csv"
+	"flag"
 	"fmt"
 	"github.com/aebruno/nwalgo"
 	"github.com/gocarina/gocsv"
 	"github.com/schollz/progressbar/v3"
 	"io"
 	"log"
+	"math"
 	"os"
 	"regexp"
 	"slices"
@@ -30,6 +32,7 @@ type MutationSet struct { // Our example struct, you can use "-" to ignore a fie
 	NonACGTNs      string `csv:"nonACGTNs"`
 	AlignmentStart int    `csv:"alignmentStart"`
 	AlignmentEnd   int    `csv:"alignmentEnd"`
+	Candidates     []int  `csv:"candidates"`
 }
 
 var referenceSequence string
@@ -48,52 +51,95 @@ var ambiguousCharacters = map[string][]string{"A": {"A"},
 	"H": {"A", "C", "T"},
 	"D": {"A", "G", "T"},
 	"B": {"C", "G", "T"},
-	"N": {"A", "C", "G", "T"},
 	"X": {"A", "C", "G", "T"}}
 
 func main() {
+	reader := bufio.NewReader(os.Stdin)
+	fmt.Print("Enter process name: ")
+	processName, _ := reader.ReadString('\n')
+	var useCandidates bool
+	flag.BoolVar(&useCandidates, "candidates", false, "Use similarity candidates")
+	var ignoreMissings bool
+	flag.BoolVar(&ignoreMissings, "ignore-missings", false, "Ignore missings in distance calculation")
+	var ignoreProper bool
+	flag.BoolVar(&ignoreProper, "ignore-proper", false, "Ignore proper chars limit in distance calculation")
+	flag.Parse()
 	referenceSequence = readFromTxt("reference.txt")
-	positionMutationMap, identifierMapping, nCountMapping := extractDataFromCsv("sequences_duesseldorf_april_2022.csv")
+	positionMutationMap, identifierMapping, nCountMapping, candidates := extractDataFromCsv("sequences/nrw_202203_with_candidates.csv")
 	start := time.Now()
-	distanceMap := make(map[int]map[int]int)
+	distanceMap := make(map[int]map[int]float64)
 	var wg sync.WaitGroup
 	var mutex sync.Mutex
 	bar := progressbar.Default(int64((len(positionMutationMap) * (len(positionMutationMap) - 1)) / 2))
 	for i := 0; i < len(identifierMapping); i++ {
-		distanceMap[i] = make(map[int]int)
+		distanceMap[i] = make(map[int]float64)
 		distanceMap[i][i] = 0
 		for j := 0; j < i; j++ {
 			wg.Add(1)
 			bar.Add(1)
 			go func(i int, j int) {
-				sequence1, sequence2 := alignSequences(positionMutationMap[i], positionMutationMap[j])
-				distance := calculateDistanceBetweenSequences(sequence1, sequence2, nCountMapping[i], nCountMapping[j])
 				mutex.Lock()
-				distanceMap[i][j] = distance
+				distanceMap[i][j] = 1000
 				mutex.Unlock()
+				if !useCandidates || slices.Contains(candidates[i], j) {
+					sequence1, sequence2 := alignSequences(positionMutationMap[i], positionMutationMap[j], ignoreMissings)
+					distance := calculateDistanceBetweenSequences(sequence1, sequence2, nCountMapping[i], nCountMapping[j], ignoreMissings, ignoreProper)
+					mutex.Lock()
+					distanceMap[i][j] = distance
+					mutex.Unlock()
+				}
 				wg.Done()
 			}(i, j)
 		}
 		wg.Wait()
 	}
 	elapsed := time.Since(start)
-	distanceMatrix := assembleDistanceMatrix(distanceMap)
-	sortedDistanceMatrix := sortDistanceMatrix(distanceMatrix)
-	persistDistanceMatrixAsCsv(sortedDistanceMatrix, identifierMapping)
 	fmt.Printf("Time elapsed: %s\n", elapsed)
+	finishProcess(distanceMap, identifierMapping, processName)
 }
 
-func extractDataFromCsv(fileName string) (map[int]map[int]map[string]string, map[int]string, map[int]int) {
+func getNWeights(positionMutationMap map[int]map[int]map[string]string, sequenceCount int) map[int]float64 {
+	nCounts := make(map[int]float64)
+	nWeights := make(map[int]float64)
+	for i := 0; i < len(positionMutationMap); i++ {
+		for position, mutations := range positionMutationMap[i] {
+			char, snpExists := mutations["snp"]
+			_, countExists := nCounts[position]
+			if !countExists {
+				nCounts[position] = 0
+			}
+			if snpExists && char == "N" {
+				nCounts[position]++
+			}
+		}
+	}
+	for position, nCount := range nCounts {
+		nWeights[position] = 1 - (nCount / float64(sequenceCount))
+	}
+	return nWeights
+}
+
+func finishProcess(distanceMap map[int]map[int]float64, identifierMapping map[int]string, processName string) {
+	distanceMatrix := assembleDistanceMatrix(distanceMap)
+	sortedDistanceMatrix := sortDistanceMatrix(distanceMatrix)
+	processName = strings.TrimSpace(processName)
+	persistDistanceMatrixAsCsv(sortedDistanceMatrix, identifierMapping, processName)
+	fmt.Println("Distances matrix was persisted as distance_matrix_" + processName + ".csv")
+}
+
+func extractDataFromCsv(fileName string) (map[int]map[int]map[string]string, map[int]string, map[int]int, map[int][]int) {
 	mutationSets := readCsvFile(fileName)
 	positionMutations := make(map[int]map[int]map[string]string)
 	identifierMapping := make(map[int]string)
 	nCountMapping := make(map[int]int)
+	candidates := make(map[int][]int)
 	for i := 0; i < len(mutationSets); i++ {
 		identifierMapping[i] = mutationSets[i].Id
 		nCountMapping[i] = mutationSets[i].NCount
 		positionMutations[i] = getPositionMutationsForSequence(mutationSets[i])
+		candidates[i] = mutationSets[i].Candidates
 	}
-	return positionMutations, identifierMapping, nCountMapping
+	return positionMutations, identifierMapping, nCountMapping, candidates
 }
 
 func readCsvFile(filePath string) []MutationSet {
@@ -296,20 +342,27 @@ func extractPositionNonACGTNs(nonACGTnStrings []string, positionMutations map[in
 
 // not tested yet
 func addNonACGTNs(nonACGTnString string, positionMutations map[int]map[string]string) map[int]map[string]string {
-	re := regexp.MustCompile(`^(\d+):(.+)$`)
+	re := regexp.MustCompile(`(.+):(\d+)(?:-(\d+))?`)
 	matches := re.FindStringSubmatch(nonACGTnString)
-	position, _ := strconv.Atoi(matches[1])
+	character := matches[1]
 	// csv mutation string indices start at 1
-	position--
-	character := matches[2]
-	if positionMutations[position] == nil {
-		positionMutations[position] = make(map[string]string)
+	begin, _ := strconv.Atoi(matches[2])
+	begin--
+	end := begin + 1
+	if len(matches) == 2 {
+		end, _ = strconv.Atoi(matches[3])
 	}
-	positionMutations[position]["snp"] = character
+	for position := begin; position < end; position++ {
+		if positionMutations[position] == nil {
+			positionMutations[position] = make(map[string]string)
+		}
+		positionMutations[position]["snp"] = character
+	}
 	return positionMutations
+
 }
 
-func alignSequences(mutationsMapSample1 map[int]map[string]string, mutationsMapSample2 map[int]map[string]string) ([]string, []string) {
+func alignSequences(mutationsMapSample1 map[int]map[string]string, mutationsMapSample2 map[int]map[string]string, ignoreMissings bool) ([]string, []string) {
 	var sequence1 []string
 	var sequence2 []string
 
@@ -332,10 +385,18 @@ func alignSequences(mutationsMapSample1 map[int]map[string]string, mutationsMapS
 		substitutionCharacter1, substitutionExists1 := mutations1["snp"]
 		substitutionCharacter2, substitutionExists2 := mutations2["snp"]
 		if substitutionExists1 {
-			additions1 = append(additions1, substitutionCharacter1)
+			if ignoreMissings && substitutionCharacter1 == "N" {
+				additions1 = append(additions1, referenceNucleotide)
+			} else {
+				additions1 = append(additions1, substitutionCharacter1)
+			}
 		}
 		if substitutionExists2 {
-			additions2 = append(additions2, substitutionCharacter2)
+			if ignoreMissings && substitutionCharacter2 == "N" {
+				additions2 = append(additions2, referenceNucleotide)
+			} else {
+				additions2 = append(additions2, substitutionCharacter2)
+			}
 		}
 
 		// handle deletions
@@ -408,8 +469,8 @@ func alignSequences(mutationsMapSample1 map[int]map[string]string, mutationsMapS
 	return sequence1, sequence2
 }
 
-func calculateDistanceBetweenSequences(sequence1 []string, sequence2 []string, nCount1 int, nCount2 int) int {
-	distance := 0
+func calculateDistanceBetweenSequences(sequence1 []string, sequence2 []string, nCount1 int, nCount2 int, ignoreMissings bool, ignoreProper bool) float64 {
+	distance := 0.0
 	sequenceLength1 := len(sequence1)
 	sequenceLength2 := len(sequence2)
 	activeGap1 := false
@@ -418,9 +479,14 @@ func calculateDistanceBetweenSequences(sequence1 []string, sequence2 []string, n
 	properCharsSeen1 := 0
 	properCharsSeen2 := 0
 
-	for i := 0; i < len(sequence1); i++ {
+	sequenceLength := int(math.Min(float64(len(sequence1)), float64(len(sequence2))))
+
+	for i := 0; i < sequenceLength; i++ {
 		character1 := sequence1[i]
 		character2 := sequence2[i]
+
+		nWeight := 1.0
+
 		if character1 == "N" || character2 == "N" {
 			continue
 		}
@@ -432,19 +498,21 @@ func calculateDistanceBetweenSequences(sequence1 []string, sequence2 []string, n
 			properCharsSeen2++
 		}
 
-		properCharsAmount1 := sequenceLength1 - nCount1
-		properCharsAmount2 := sequenceLength2 - nCount2
-		if properCharsSeen1 < properCharsThreshold ||
-			properCharsSeen2 < properCharsThreshold ||
-			(properCharsAmount1-properCharsSeen1 < properCharsThreshold) ||
-			(properCharsAmount2-properCharsSeen2 < properCharsThreshold) ||
-			character1 == character2 {
-			continue
+		if !ignoreProper {
+			properCharsAmount1 := sequenceLength1 - nCount1
+			properCharsAmount2 := sequenceLength2 - nCount2
+			if properCharsSeen1 < properCharsThreshold ||
+				properCharsSeen2 < properCharsThreshold ||
+				(properCharsAmount1-properCharsSeen1 < properCharsThreshold) ||
+				(properCharsAmount2-properCharsSeen2 < properCharsThreshold) ||
+				character1 == character2 {
+				continue
+			}
 		}
 
 		if character1 == "-" {
 			if !activeGap1 {
-				distance++
+				distance += 1.0 * nWeight
 			}
 			activeGap1 = true
 			activeGap2 = false
@@ -456,11 +524,9 @@ func calculateDistanceBetweenSequences(sequence1 []string, sequence2 []string, n
 			activeGap1 = false
 			activeGap2 = true
 		}
-
-		if character1 != "-" && character2 != "-" &&
-			!slices.Contains(ambiguousCharacters[character1], character2) &&
+		if character1 != "-" && character2 != "-" && !slices.Contains(ambiguousCharacters[character1], character2) &&
 			!slices.Contains(ambiguousCharacters[character2], character1) {
-			distance++
+			distance += 1.0 * nWeight
 			activeGap1 = false
 			activeGap2 = false
 		}
@@ -469,17 +535,17 @@ func calculateDistanceBetweenSequences(sequence1 []string, sequence2 []string, n
 	return distance
 }
 
-func assembleDistanceMatrix(distanceMap map[int]map[int]int) map[int]map[int]int {
-	distanceMatrix := make(map[int]map[int]int)
+func assembleDistanceMatrix(distanceMap map[int]map[int]float64) map[int]map[int]float64 {
+	distanceMatrix := make(map[int]map[int]float64)
 	for i := 0; i < len(distanceMap); i++ {
 		if distanceMatrix[i] == nil {
-			distanceMatrix[i] = make(map[int]int)
+			distanceMatrix[i] = make(map[int]float64)
 		}
 		for j := 0; j <= i; j++ {
 			distance := distanceMap[i][j]
 			distanceMatrix[i][j] = distance
 			if distanceMatrix[j] == nil {
-				distanceMatrix[j] = make(map[int]int)
+				distanceMatrix[j] = make(map[int]float64)
 			}
 			distanceMatrix[j][i] = distance
 
@@ -488,21 +554,21 @@ func assembleDistanceMatrix(distanceMap map[int]map[int]int) map[int]map[int]int
 	return distanceMatrix
 }
 
-func sortDistanceMatrix(distanceMatrix map[int]map[int]int) map[int]map[int]int {
+func sortDistanceMatrix(distanceMatrix map[int]map[int]float64) map[int]map[int]float64 {
 	keys := make([]int, 0, len(distanceMatrix))
 	for k := range distanceMatrix {
 		keys = append(keys, k)
 	}
 	sort.Ints(keys)
-	sortedDistanceMatrix := make(map[int]map[int]int)
+	sortedDistanceMatrix := make(map[int]map[int]float64)
 	for _, k := range keys {
 		sortedDistanceMatrix[k] = distanceMatrix[k]
 	}
 	return sortedDistanceMatrix
 }
 
-func persistDistanceMatrixAsCsv(distanceMatrix map[int]map[int]int, identifierMapping map[int]string) {
-	file, err := os.Create("distance_matrix.csv")
+func persistDistanceMatrixAsCsv(distanceMatrix map[int]map[int]float64, identifierMapping map[int]string, processName string) {
+	file, err := os.Create("distance_matrix_" + processName + ".csv")
 	defer file.Close()
 	if err != nil {
 		log.Fatalln("failed to open file", err)
@@ -520,7 +586,7 @@ func persistDistanceMatrixAsCsv(distanceMatrix map[int]map[int]int, identifierMa
 		row := []string{identifierMapping[i]}
 		for j := 0; j < len(distanceMatrix); j++ {
 			distance := distances[j]
-			row = append(row, strconv.Itoa(distance))
+			row = append(row, strconv.Itoa(int(distance)))
 		}
 		distanceRows = append(distanceRows, row)
 	}
